@@ -22,6 +22,7 @@ type Cmd struct {
 	MaxGasPrice       *big.Float `args required name:"maxGasPrice" help:"max gas price to use" type:"BigFloat"`
 }
 
+//starts the liquidator bot with the provided configuration
 func (c *Cmd) Run() error {
 	glog.Info("Decrypting keystore...")
 	signer, err := c.KeystoreConfig.Apply()
@@ -64,7 +65,7 @@ func (c *Cmd) Run() error {
 		return errors.New("error while converting eth amount")
 	}
 
-	liquidator, err := NewLiquidator(context.Background(), signer, client, nftVault, liquidatorContract, oracleContracts, big.NewInt(28158989), maxGasPrice)
+	liquidator, err := NewLiquidator(context.Background(), signer, client, nftVault, liquidatorContract, oracleContracts, maxGasPrice)
 	if err != nil {
 		return err
 	}

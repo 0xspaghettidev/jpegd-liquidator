@@ -8,6 +8,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 )
 
+//helper struct that allows tx and hash signing
 type Signer struct {
 	accounts.Account
 	k *keystore.KeyStore

@@ -12,6 +12,7 @@ import (
 	"github.com/0xspaghettidev/jpegd-liquidator/common"
 )
 
+//decrypts the password protected keystore for the address passed as `addressHex`
 func Decrypt(addressHex string, path string) (*common.Signer, error) {
 	password, err := passwordFromStdIn()
 

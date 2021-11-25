@@ -12,7 +12,9 @@ type Cmd struct {
 	OutDir string `args optional name:"outDir" help:"The output file path" type:"path" default:"./keystores"`
 }
 
+//creates a password protected keystore
 func (c *Cmd) Run() error {
+	//take private key and password from stdin
 	keyHex, password, err := keystoreDataFromStdIn()
 
 	if err != nil {

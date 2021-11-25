@@ -2,6 +2,7 @@ package liquidator
 
 import (
 	"context"
+	"errors"
 	"math/big"
 	"time"
 
@@ -21,32 +22,18 @@ type Liquidator struct {
 	nftVault       *utils.Contract
 	liquidator     *utils.Contract
 	oracles        []*utils.Contract
-	startBlock     *big.Int
-	positions      map[int64]bool
-	eventChan      chan types.Log
 	errorChan      chan error
 	chainId        *big.Int
 	maxGasPrice    *big.Int
 	eip1559Support bool
 }
 
-var positionOpenedTopic = crypto.Keccak256Hash([]byte("PositionOpened(address,uint256)"))
-var positionClosedTopic = crypto.Keccak256Hash([]byte("PositionClosed(address,uint256)"))
-var positionLiquidatedTopic = crypto.Keccak256Hash([]byte("Liquidated(address,address,uint256)"))
-var positionInsuranceExpiredTopic = crypto.Keccak256Hash([]byte("InsuranceExpired(address,uint256)"))
-var positionRepurchasedTopic = crypto.Keccak256Hash([]byte("Repurchased(address,uint256)"))
 var answerUpdatedTopic = crypto.Keccak256Hash([]byte("AnswerUpdated(int256,uint256,uint256)"))
 
-var positionEventMap = map[ethUtils.Hash]string{
-	positionOpenedTopic:           "PositionOpened",
-	positionClosedTopic:           "PositionClosed",
-	positionLiquidatedTopic:       "Liquidated",
-	positionInsuranceExpiredTopic: "InsuranceExpired",
-	positionRepurchasedTopic:      "Repurchased",
-	answerUpdatedTopic:            "AnswerUpdated",
-}
+//creates a new instance of the liquidator bot
+func NewLiquidator(ctx context.Context, signer *common.Signer, client *ethclient.Client, nftVault *utils.Contract,
+	liquidator *utils.Contract, oracles []*utils.Contract, maxGasPrice *big.Int) (*Liquidator, error) {
 
-func NewLiquidator(ctx context.Context, signer *common.Signer, client *ethclient.Client, nftVault *utils.Contract, liquidator *utils.Contract, oracles []*utils.Contract, startBlock *big.Int, maxGasPrice *big.Int) (*Liquidator, error) {
 	chainId, err := client.ChainID(ctx)
 	if err != nil {
 		return nil, err
@@ -63,9 +50,6 @@ func NewLiquidator(ctx context.Context, signer *common.Signer, client *ethclient
 		client:         client,
 		nftVault:       nftVault,
 		liquidator:     liquidator,
-		startBlock:     startBlock,
-		positions:      map[int64]bool{},
-		eventChan:      make(chan types.Log),
 		errorChan:      make(chan error),
 		chainId:        chainId,
 		maxGasPrice:    maxGasPrice,
@@ -74,120 +58,41 @@ func NewLiquidator(ctx context.Context, signer *common.Signer, client *ethclient
 	}, nil
 }
 
+//Starts the liquidator bot with the configuration parameters passed in `NewLiquidator`.
+//The bot checks positions every time the oracles passed in the `NewLiquidator` function
+//are updated
 func (l *Liquidator) Start(ctx context.Context) error {
-	glog.Infoln("Starting initialization...")
+	glog.Infoln("Starting liquidator bot...")
 
-	addresses := make([]ethUtils.Address, len(l.oracles)+1)
+	addresses := make([]ethUtils.Address, len(l.oracles))
 	for i, c := range l.oracles {
 		addresses[i] = c.Address
 	}
 
-	addresses[len(addresses)-1] = l.nftVault.Address
-
 	query := ethereum.FilterQuery{
 		Addresses: addresses,
 		Topics: [][]ethUtils.Hash{{
-			positionOpenedTopic,
-			positionClosedTopic,
-			positionLiquidatedTopic,
-			positionInsuranceExpiredTopic,
-			positionRepurchasedTopic,
 			answerUpdatedTopic,
 		}},
 	}
 
-	midChan := make(chan types.Log)
-	sub, err := l.client.SubscribeFilterLogs(ctx, query, midChan)
+	eventChan := make(chan types.Log)
+
+	sub, err := l.client.SubscribeFilterLogs(ctx, query, eventChan)
 	if err != nil {
 		return err
 	}
 
-	go l.eventListener(ctx)
-
-	query = ethereum.FilterQuery{
-		FromBlock: l.startBlock,
-		Addresses: []ethUtils.Address{l.nftVault.Address},
-		Topics: [][]ethUtils.Hash{{
-			positionOpenedTopic,
-			positionClosedTopic,
-			positionInsuranceExpiredTopic,
-			positionRepurchasedTopic,
-		}},
-	}
-
-	glog.Infoln("Fetching historical position logs starting from block", l.startBlock.String()+"...")
-	logs, err := l.client.FilterLogs(ctx, query)
-	if err != nil {
-		return err
-	}
-
-	glog.Infoln("Fetched", len(logs), "logs.")
-
-	for _, log := range logs {
-		l.eventChan <- log
-	}
-
-	glog.Infoln("Checking historical positions...")
-	l.checkPositions(ctx)
-
-	glog.Infoln("Initialization completed, found", len(l.positions), "valid positions.")
+	glog.Infoln("Liquidator bot started.")
 
 	for {
 		select {
+		case <-eventChan:
+			go l.checkPositions(ctx)
 		case err := <-sub.Err():
 			return err
 		case err := <-l.errorChan:
 			return err
-		case event := <-midChan:
-			l.eventChan <- event
-		}
-	}
-}
-
-func (l *Liquidator) eventListener(ctx context.Context) {
-	for {
-		log := <-l.eventChan
-		eventName := positionEventMap[log.Topics[0]]
-		event, err := l.nftVault.ABI.Unpack(eventName, log.Data)
-		if err != nil {
-			l.errorChan <- err
-			return
-		}
-
-		switch eventName {
-		case "PositionClosed", "InsuranceExpired", "Repurchased":
-			index, ok := event[1].(*big.Int)
-			if ok {
-				glog.Infoln("Received", eventName, "event for index", index.String())
-				delete(l.positions, index.Int64())
-			} else {
-				glog.Warningln("Found", eventName, "event, but failed to parse position index")
-			}
-		case "PositionOpened":
-			index, ok := event[1].(*big.Int)
-			if ok {
-				glog.Infoln("Received", eventName, "event for index", index.String())
-				l.positions[index.Int64()] = true
-			} else {
-				glog.Warningln("Found PositionOpened event, but failed to parse position index")
-			}
-		case "Liquidated":
-			index, ok := event[2].(*big.Int)
-			glog.Infoln("Received", eventName, "event for index", index.String())
-			if ok {
-				result, err := l.getPosition(ctx, index)
-				if err != nil {
-					l.errorChan <- err
-					return
-				}
-
-				if result.Preview.BorrowType == 0 {
-					delete(l.positions, index.Int64())
-				}
-			}
-		case "AnswerUpdated":
-			glog.Info("Received", eventName, "event. Checking", len(l.positions), "positions.")
-			l.checkPositions(ctx)
 		}
 	}
 }
@@ -209,33 +114,42 @@ type positionPreview struct {
 	}
 }
 
+//checks if there are any liquidatable/claimable positions and tries to liquidate/claim them
 func (l *Liquidator) checkPositions(ctx context.Context) {
 	liquidatable := make([]*big.Int, 0)
 	claimable := make([]*big.Int, 0)
 
-	for k, v := range l.positions {
-		if v {
-			index := big.NewInt(k)
-			result, err := l.getPosition(ctx, index)
-			if err != nil {
-				l.errorChan <- err
-				return
-			}
+	openPositionsRaw, err := l.nftVault.Call(ctx, "openPositionsIndexes")
+	if err != nil {
+		l.errorChan <- err
+		return
+	}
 
-			if result.Preview.BorrowType == 0 {
-				glog.Warningln("Found closed position, index is", index.String()+". Deleting.")
-				delete(l.positions, index.Int64())
-				continue
-			}
+	openPositions, err := l.nftVault.ABI.Unpack("openPositionsIndexes", openPositionsRaw)
+	if err != nil {
+		l.errorChan <- err
+		return
+	}
 
-			if result.Preview.Liquidatable {
-				glog.Infoln("Found liquidatable position, index is", index.String())
-				liquidatable = append(liquidatable, index)
-			} else if result.Preview.LiquidatedAt.Cmp(big.NewInt(0)) == 1 &&
-				new(big.Int).Sub(big.NewInt(time.Now().Unix()), result.Preview.LiquidatedAt).Cmp(big.NewInt(86400*3)) > 0 {
-				glog.Infoln("Found position with expired insurance, index is", index.String())
-				claimable = append(claimable, index)
-			}
+	for _, v := range openPositions {
+		index, ok := v.(*big.Int)
+		if !ok {
+			l.errorChan <- errors.New("error while fetching open positions")
+		}
+
+		result, err := l.getPosition(ctx, index)
+		if err != nil {
+			l.errorChan <- err
+			return
+		}
+
+		if result.Preview.Liquidatable {
+			glog.Infoln("Found liquidatable position, index is", index.String())
+			liquidatable = append(liquidatable, index)
+		} else if result.Preview.LiquidatedAt.Cmp(big.NewInt(0)) == 1 &&
+			new(big.Int).Sub(big.NewInt(time.Now().Unix()), result.Preview.LiquidatedAt).Cmp(big.NewInt(86400*3)) > 0 {
+			glog.Infoln("Found position with expired insurance, index is", index.String())
+			claimable = append(claimable, index)
 		}
 	}
 
@@ -290,8 +204,8 @@ func (l *Liquidator) getPosition(ctx context.Context, index *big.Int) (*position
 	return result, nil
 }
 
-func (l *Liquidator) tryLiquidate(ctx context.Context, punks []*big.Int) error {
-	data, err := l.liquidator.ABI.Pack("liquidate", punks)
+func (l *Liquidator) tryLiquidate(ctx context.Context, nfts []*big.Int) error {
+	data, err := l.liquidator.ABI.Pack("liquidate", nfts)
 	if err != nil {
 		return err
 	}
@@ -299,8 +213,13 @@ func (l *Liquidator) tryLiquidate(ctx context.Context, punks []*big.Int) error {
 	return l.sendTxWithData(ctx, l.liquidator, data)
 }
 
-func (l *Liquidator) tryClaim(ctx context.Context, punks []*big.Int) error {
-	return nil
+func (l *Liquidator) tryClaim(ctx context.Context, nfts []*big.Int) error {
+	data, err := l.liquidator.ABI.Pack("claimExpiredInsuranceNFT", nfts)
+	if err != nil {
+		return err
+	}
+
+	return l.sendTxWithData(ctx, l.liquidator, data)
 }
 
 func (l *Liquidator) sendTxWithData(ctx context.Context, contract *utils.Contract, data []byte) error {

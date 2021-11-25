@@ -18,6 +18,7 @@ func GetMappers() []kong.Option {
 
 type BigFloatMapper func(ctx *kong.DecodeContext, target reflect.Value) error
 
+//converts string cli arguments to `*Big.Float`
 func (m *BigFloatMapper) Decode(ctx *kong.DecodeContext, target reflect.Value) error {
 	res := ctx.Scan.Pop().String()
 

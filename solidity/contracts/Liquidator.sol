@@ -4,72 +4,24 @@ pragma solidity ^0.8.0;
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/utils/Address.sol";
 
-interface INFTVault {
-    event PositionOpened(address owner, uint256 index);
-    event PositionClosed(address owner, uint256 index);
-    event Liquidated(address liquidator, address owner, uint256 index);
-    event Repurchased(address owner, uint256 index);
-    event InsuranceExpired(address owner, uint256 index);
-
-    struct Rate {
-        uint128 numerator;
-        uint128 denominator;
-    }
-
-    struct VaultSettings {
-        Rate debtInterestApr;
-        Rate creditLimitRate;
-        Rate liquidationLimitRate;
-        Rate valueIncreaseLockRate;
-        Rate organizationFeeRate;
-        Rate insurancePurchaseRate;
-        Rate insuranceLiquidationPenaltyRate;
-        uint256 insuraceRepurchaseTimeLimit;
-        uint256 borrowAmountCap;
-    }
-
-    struct PositionPreview {
-        address owner;
-        uint256 nftIndex;
-        bytes32 nftType;
-        uint256 nftValueUSD;
-        VaultSettings vaultSettings;
-        uint256 creditLimit;
-        uint256 debtPrincipal;
-        uint256 debtInterest;
-        BorrowType borrowType;
-        bool liquidatable;
-        uint256 liquidatedAt;
-        address liquidator;
-    }
-
-    enum BorrowType {
-        NOT_CONFIRMED,
-        NON_INSURANCE,
-        USE_INSURANCE
-    }
-
-    function showPosition(uint256 _nftIndex)
-        external
-        view
-        returns (PositionPreview memory preview);
-
-    function liquidate(uint256 _nftIndex) external;
-
-    function claimExpiredInsuranceNFT(uint256 _nftIndex) external;
-}
+import "./interfaces/INFTVault.sol";
 
 interface ICryptoPunks {
     function transferPunk(address to, uint256 punkIndex) external;
 }
 
+/// @title Liquidator escrow contract
+/// @notice Liquidator contract that allows liquidator bots to liquidate positions without holding any PUSD/NFTs.
+/// It's only meant to be used by DAO bots.
+/// The liquidated NFTs are sent to the DAO
 contract PunkLiquidator {
     using Address for address;
 
-    INFTVault nftVault;
-    ICryptoPunks cryptoPunks;
-    IERC20 pusd;
-    address dao;
+    INFTVault public immutable nftVault;
+    ICryptoPunks public immutable cryptoPunks;
+    IERC20 public immutable pusd;
+    
+    address public dao;
 
     constructor(
         INFTVault _nftVault,
@@ -83,6 +35,19 @@ contract PunkLiquidator {
         dao = _dao;
     }
 
+    modifier onlyDAO() {
+        require(msg.sender == dao, "not dao");
+        _;
+    }
+
+    /// @notice Allows any address to liquidate multiple positions at once.
+    /// It assumes enough PUSD is in the contract.
+    /// The liquidated punks are sent to the DAO
+    /// @dev This function doesn't revert if one of the positions can't be liquidated.
+    /// This is done to prevent situations in which multiple positions can't be liquidated
+    /// because of one not liquidatable position.
+    /// This function reverts when there's not enough PUSD in this contract
+    /// @param _toLiquidate The positions to liquidate
     function liquidate(uint256[] memory _toLiquidate) external {
         uint256 balance = pusd.balanceOf(address(this));
         for (uint256 i = 0; i < _toLiquidate.length; i++) {
@@ -90,6 +55,7 @@ contract PunkLiquidator {
             INFTVault.PositionPreview memory position = nftVault.showPosition(
                 nftIndex
             );
+            //ignore not liquidatable position
             if (!position.liquidatable) continue;
 
             uint256 totalDebt = position.debtPrincipal + position.debtInterest;
@@ -104,6 +70,11 @@ contract PunkLiquidator {
         }
     }
 
+    /// @notice Allows any address to claim NFTs from multiple expired insurance postions at once.
+    /// The liquidated punks are sent to the DAO
+    /// @dev This function doesn't revert if one of the NFTs isn't claimable yet. This is done to prevent
+    /// situations in which multiple NFTs can't be claimed because of one not being claimable yet
+    /// @param _toClaim The indexes of the NFTs to claim
     function claimExpiredInsuranceNFT(uint256[] memory _toClaim) external {
         for (uint256 i = 0; i < _toClaim.length; i++) {
             uint256 nftIndex = _toClaim[i];
@@ -114,6 +85,7 @@ contract PunkLiquidator {
 
             uint256 elapsed = block.timestamp - position.liquidatedAt;
 
+            //ignore not claimable NFT
             if (elapsed < position.vaultSettings.insuraceRepurchaseTimeLimit)
                 continue;
 
@@ -122,11 +94,20 @@ contract PunkLiquidator {
         }
     }
 
-    function doCalls(address[] memory targets, bytes[] memory calldatas, uint256[] memory values) external {
-        require(msg.sender == dao, "unauthorized");
-        
+    /// @notice Allows the DAO to perform multiple calls using this contract (recovering funds/NFTs stuck in this contract)
+    /// @param targets The target addresses
+    /// @param calldatas The data to pass in each call
+    /// @param values The ETH value for each call
+    function doCalls(address[] memory targets, bytes[] memory calldatas, uint256[] memory values) external payable onlyDAO {        
         for (uint256 i = 0; i < targets.length; i++) {
             targets[i].functionCallWithValue(calldatas[i], values[i]);
         }
+    }
+
+    /// @notice Allows the DAO to change the DAO address
+    /// @param _dao The new DAO address
+    function changeDAO(address _dao) external onlyDAO  {
+        require(_dao != address(0), "invalid address");
+        dao = _dao;
     }
 }
